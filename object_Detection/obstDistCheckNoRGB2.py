@@ -127,7 +127,7 @@ def create_point_cloud(camera, depth_frame=None, visualize=False):
     print(f"Generated point cloud with {len(pcd.points)} points")
     return pcd
 
-def process_camera_by_serial(device_serial=None, visualize=False):
+def process_camera_by_serial(device_serial=None, visualize=False, cameras=None):
     """
     Process a specific camera identified by its serial number.
     
@@ -135,6 +135,7 @@ def process_camera_by_serial(device_serial=None, visualize=False):
         device_serial (str, optional): Serial number of the camera to use.
                                        If None, the first available camera will be used.
         visualize (bool): Whether to visualize the point cloud.
+        cameras (list): List of available cameras.
         
     Returns:
         o3d.geometry.PointCloud or None: The created point cloud object, or None if failed.
@@ -151,13 +152,14 @@ def process_camera_by_serial(device_serial=None, visualize=False):
             
         # Initialize camera with the specified serial
         print(f"Initializing camera with serial: {device_serial}")
-        camera = initialize_camera(device_serial)
-        
+        camera = next((cam for cam in cameras if cam["device_serial"] == str(device_serial)), None)
         # Create point cloud (no save path)
+        if camera is None:
+            print(f"Camera with serial {camera_serial} not found in the CAMERAS list.")
+            return None
         pcd = create_point_cloud(camera, visualize=visualize)
         
         # Stop the camera when done
-        stop_camera(camera)
         
         return pcd
     
@@ -434,7 +436,7 @@ def visualize_and_filter_point_cloud(pcd, camera_position, max_height_inches=40,
         visualize=visualize
     )
 
-def detect_obstacles(camera_serial=None, camera_position=[0.0, 0.0, 0.0], visualize=True):
+def detect_obstacles(camera_serial=None, camera_position=[0.0, 0.0, 0.0], visualize=True, cameras=None):
     """
     Complete obstacle detection pipeline that generates point cloud from camera
     and detects obstacles.
@@ -462,7 +464,7 @@ def detect_obstacles(camera_serial=None, camera_position=[0.0, 0.0, 0.0], visual
     # Process camera to get point cloud
     pcd = process_camera_by_serial(
         device_serial=camera_serial,
-        visualize=visualize  # Pass the visualization flag
+        visualize=visualize, cameras=cameras  # Pass the visualization flag
     )
     
     if pcd:
