@@ -315,24 +315,24 @@ def turn_right(speed:int):
 	motor2.drive(2,-speed)	# Turn on motor 2
 
 
-motor1 = Sabertooth("/dev/ttyAMA10", baudrate = 9600, address = 129)	# Init the Motor
+motor1 = Sabertooth("/dev/ttyAMA0", baudrate = 9600, address = 129)	# Init the Motor
 motor1.open()								# Open then connection
 print(f"Connection Status: {motor1.saber.is_open}")			# Let us know if it is open
 motor1.info()								# Get the motor info
 
 
 ## Init up the sabertooth 2, and open the seral connection 
-motor2 = Sabertooth("/dev/ttyAMA10", baudrate = 9600, address = 134)	# Init the Motor
+motor2 = Sabertooth("/dev/ttyAMA0", baudrate = 9600, address = 134)	# Init the Motor
 motor2.open()								# Open then connection
 print(f"Connection Status: {motor2.saber.is_open}")			# Let us know if it is open
 motor2.info()								# Get the motor info
 
-construction_motors = Sabertooth("/dev/ttyAMA10", baudrate = 9600, address = 128)	# Init the Motor
+construction_motors = Sabertooth("/dev/ttyAMA0", baudrate = 9600, address = 128)	# Init the Motor
 construction_motors.open()								# Open then connection
 print(f"Connection Status: {construction_motors.saber.is_open}")			# Let us know if it is open
 construction_motors.info()								# Get the motor info
 
-LA = LA.linearactuator.linearactuator()		# Init the linear actuator
+LA = LA.linearactuator()		# Init the linear actuator
 try:
     with contextlib.ExitStack() as stack:
         deviceInfos = dai.Device.getAllAvailableDevices()
@@ -478,13 +478,18 @@ try:
                 color_images, imuQueue, aruco_detector, marker_size, baseTs, prev_gyroTs, camera_position, pose
             )
             
+            if cv2.waitKey(1) == ord('q'):
+                break
+
             if pose is None:
                 turn_left(20)  # If pose is None, rotate to find ArUco markers
+                print("Pose is None, rotating to find ArUco markers")
                 continue
             
             
             # Check if we have reached the current waypoint
             if not at_waypoint:
+                print("checking if not at waypoint")
                 if abs(pose[0] - WAYPOINTS[current_waypoint_index][0]) <= 0.5 and abs(pose[1] - WAYPOINTS[current_waypoint_index][1]) <= 0.5:
                     print(f"Arrived at waypoint {current_waypoint_index} ({WAYPOINTS[current_waypoint_index][2]}) at position {pose}.")
                     stop_all()
@@ -499,11 +504,13 @@ try:
             
             # Handle waypoint activities if we're at a waypoint
             if at_waypoint:
+                print("At waypoint, checking actions...")
                 # Process waypoint actions based on waypoint type
                 if WAYPOINTS[current_waypoint_index][2] == "mine":
                     if i == 0:
                         initial_excavation_time = time.time()
                         i += 1
+                        print("Starting excavation...")
                         
                     if excavate(initial_excavation_time):
                         at_waypoint = False
@@ -517,6 +524,7 @@ try:
                     if i == 0:
                         initial_deposit_time = time.time()
                         i += 1
+                        print("Starting deposition...")
 
                     if deposit(initial_deposit_time):
                         at_waypoint = False
@@ -542,11 +550,13 @@ try:
                     elif last_permanent_waypoint == EXCAVATION_INDEX:
                         # We came from excavation, now go to deposition
                         destination_index = DEPOSITION_INDEX
+                        print("Going to deposition after excavation.")
                         
                         
                     elif last_permanent_waypoint == DEPOSITION_INDEX:
                         # We came from deposition, go back to excavation
                         destination_index = EXCAVATION_INDEX
+                        print("Going to excavation after deposition.")
                         
                 continue
             
@@ -554,6 +564,7 @@ try:
             # Obstacle scanning and avoidance logic for discovery mode
             if need_to_scan:
                 if not scanning_in_progress:
+                    print("Need to scan for obstacles, starting scan...")
                     # Initialize scan
                     scanning_in_progress = True
                     scan_stage = 0  # 0: initial rotation, 1: front scan, 2: left scan, 3: back scan, 4: create waypoint
@@ -563,6 +574,7 @@ try:
                     
                 # Stage 0: Rotate to face target waypoint
                 if scan_stage == 0:
+                    print("if scan stage 0")
                     if abs(pose[2] - target_angle) > 5:
                         turn_to(target_angle)
                         print(f"Turning to target angle: {target_angle}, current angle: {pose[2]}")
@@ -572,6 +584,7 @@ try:
                 
                 # Stage 1: Front scan
                 elif scan_stage == 1:
+                    print("if scan stage 1")
                     # Check front obstacle using the front camera (realsense-327122073351)
                     front_distance = scan.detect_obstacles(247122073398, cameras=CAMERAS)
                     print(f"Front obstacle detection: {front_distance} meters")
@@ -738,8 +751,7 @@ try:
                     print(f"Moving to waypoint {current_waypoint_index} at position {WAYPOINTS[current_waypoint_index]}, current position {pose}")
                     last_print_time = current_time
             
-            if cv2.waitKey(1) == ord('q'):
-                break
+            
 
 except Exception as e:
     print(f"An error occurred: {e}")
