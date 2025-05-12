@@ -1,0 +1,98 @@
+'''
+-----------------------------------------------------
+-----------------------------------------------------
+Lunabotics Linear Actuator Testing
+Author: NotAWildernessExplorer
+Date: 04/11/2025 
+-----------------------------------------------------
+-----------------------------------------------------
+Connections for BST7960 to Pi 5
+Pin 1:	GPIO 12 
+Pin 2:	GPIO 13
+Pin 3:	3V
+Pin 4:	3V
+Pin 5:	NC
+Pin 6: 	NC
+Pin 7:	3V
+Pin 8:	GND
+-----------------------------------------------------
+-----------------------------------------------------
+'''
+
+## import library 
+import time                # What time is it? Well, this library will tell you!!! 
+import lgpio              # Using lgpio instead of RPi.GPIO for Pi 5
+
+## Initialize connection to local GPIO chip
+h = lgpio.gpiochip_open(0)  # Open the default gpiochip
+
+## Luna linear actuators start here!
+class linearactuator():
+    def __init__(self):
+        # GPIO pin numbers - using BCM numbering, not BOARD
+        self.R_PIN = 12  # GPIO 12
+        self.L_PIN = 13  # GPIO 13
+        
+        # Configure pins as outputs
+        lgpio.gpio_claim_output(h, self.R_PIN)  # Claim GPIO 12 as output
+        lgpio.gpio_claim_output(h, self.L_PIN)  # Claim GPIO 13 as output
+        
+        # Initialize PWM on both pins
+        self.R_PWM = lgpio.tx_pwm(h, self.R_PIN, 125000000, 0)  # 125 MHz PWM, 0% duty cycle
+        self.L_PWM = lgpio.tx_pwm(h, self.L_PIN, 125000000, 0)  # 125 MHz PWM, 0% duty cycle
+        
+    def move(self, qty):
+        '''
+        Changes motor controller duty cycle\n
+        qty > 0: extend \n
+        qty < 0: retract \n
+        qty = 0: stop
+        '''
+        if qty > 0:
+            self.stop()                       # Stop motors
+            time.sleep(0.001)                 # wait
+            lgpio.tx_pwm(h, self.R_PIN, 125000000, 100)  # 100% duty cycle
+        elif qty < 0:
+            self.stop()                       # Stop motors
+            time.sleep(0.001)                 # wait
+            lgpio.tx_pwm(h, self.L_PIN, 125000000, 100)  # 100% duty cycle
+        else:
+            self.stop()                       # Stop motors
+            time.sleep(0.001)                 # wait
+
+    def stop(self):
+        '''stops the motors'''
+        lgpio.tx_pwm(h, self.R_PIN, 125000000, 0)  # Set forward pwm to zero
+        lgpio.tx_pwm(h, self.L_PIN, 125000000, 0)  # set reverse pwm to zero
+
+    def cleanup(self):
+        '''Release the GPIO pins'''
+        lgpio.tx_pwm(h, self.R_PIN, 0, 0)  # Stop PWM
+        lgpio.tx_pwm(h, self.L_PIN, 0, 0)  # Stop PWM
+        lgpio.gpio_free(h, self.R_PIN)     # Free the GPIO
+        lgpio.gpio_free(h, self.L_PIN)     # Free the GPIO
+
+
+try:
+    ## init the actuators
+    LA = linearactuator()
+
+    ## move forward
+    print("Start")
+    LA.move(+1)
+    time.sleep(3)
+
+    ## move in reverse
+    print("Rev")
+    LA.move(-1)
+    print("Done")
+    time.sleep(3)
+
+    ## we done
+    LA.stop()
+    
+finally:
+    ## Cleanup resources
+    if 'LA' in locals():
+        LA.cleanup()
+    lgpio.gpiochip_close(h)  # Close the GPIO chip
