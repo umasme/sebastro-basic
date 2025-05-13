@@ -1,0 +1,639 @@
+import pyrealsense2 as rs
+import numpy as np
+import open3d as o3d
+import sys
+import os
+from threading import Lock
+
+# Add debug logging
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Global lock for Open3D visualization
+visualization_lock = Lock()
+
+def list_available_cameras():
+    """
+    List all available RealSense devices.
+    
+    Returns:
+        list: List of device serial numbers.
+    """
+    try:
+        context = rs.context()
+        devices = context.query_devices()
+        serials = [device.get_info(rs.camera_info.serial_number) for device in devices]
+        logger.info(f"Found {len(serials)} RealSense cameras: {serials}")
+        return serials
+    except Exception as e:
+        logger.error(f"Error listing cameras: {e}")
+        return []
+
+def initialize_camera(device_serial=None):
+    """
+    Initialize a RealSense camera.
+    
+    Args:
+        device_serial (str, optional): Serial number of the specific camera to use.
+                                       If None, the first available camera will be used.
+    
+    Returns:
+        dict: A dictionary containing the pipeline, config, and device_serial
+    """
+    try:
+        logger.info("Creating pipeline")
+        pipeline = rs.pipeline()
+        config = rs.config()
+        
+        # If a specific device serial is provided, use it
+        if device_serial:
+            logger.info(f"Enabling device with serial: {device_serial}")
+            config.enable_device(device_serial)
+            
+        # Configure only depth stream - removed color stream
+        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        
+        # Start the pipeline
+        logger.info("Starting pipeline")
+        profile = pipeline.start(config)
+        logger.info("Pipeline started")
+        
+        # If no serial was provided, get it from the active device
+        if not device_serial:
+            device = profile.get_device()
+            device_serial = device.get_info(rs.camera_info.serial_number)
+            logger.info(f"Using device with serial: {device_serial}")
+        
+        # Return all necessary components as a "camera" object
+        camera = {
+            "pipeline": pipeline,
+            "config": config,
+            "device_serial": device_serial,
+            "is_running": True
+        }
+        
+        return camera
+    except Exception as e:
+        logger.error(f"Error initializing camera: {e}")
+        raise
+
+def stop_camera(camera):
+    """
+    Stop the camera pipeline.
+    
+    Args:
+        camera (dict): Camera object returned by initialize_camera()
+    """
+    try:
+        if camera["is_running"]:
+            logger.info("Stopping camera pipeline")
+            camera["pipeline"].stop()
+            camera["is_running"] = False
+    except Exception as e:
+        logger.error(f"Error stopping camera: {e}")
+
+def get_frames(camera):
+    """
+    Get depth frames from the camera.
+    
+    Args:
+        camera (dict): Camera object returned by initialize_camera()
+        
+    Returns:
+        depth_frame: Depth frame
+    """
+    if not camera["is_running"]:
+        raise RuntimeError("Camera pipeline is not running")
+    
+    try:
+        logger.info("Waiting for frames")
+        frames = camera["pipeline"].wait_for_frames()
+        depth_frame = frames.get_depth_frame()
+        logger.info("Depth frame acquired")
+        
+        return depth_frame
+    except Exception as e:
+        logger.error(f"Error getting frames: {e}")
+        raise
+
+def create_point_cloud(camera, depth_frame=None, visualize=False):
+    """
+    Create a point cloud from camera frames using depth only.
+    
+    Args:
+        camera (dict): Camera object returned by initialize_camera()
+        depth_frame: Depth frame. If None, will capture a new frame.
+        visualize (bool): Whether to visualize the point cloud.
+        
+    Returns:
+        o3d.geometry.PointCloud: The created point cloud object.
+    """
+    # Get frames if not provided
+    if depth_frame is None:
+        logger.info("No depth frame provided, getting new frame")
+        depth_frame = get_frames(camera)
+    
+    if not depth_frame:
+        raise RuntimeError("Failed to capture valid frames")
+    
+    try:
+        # Convert depth frame to numpy array
+        logger.info("Converting depth frame to numpy array")
+        depth_image = np.asanyarray(depth_frame.get_data())
+
+        # Get intrinsics for point cloud calculation
+        profile = camera["pipeline"].get_active_profile()
+        depth_profile = rs.video_stream_profile(profile.get_stream(rs.stream.depth))
+        depth_intrinsics = depth_profile.get_intrinsics()
+        
+        # Create point cloud from depth
+        logger.info("Creating point cloud from depth data")
+        pc = rs.pointcloud()
+        points = pc.calculate(depth_frame)
+        vertices = np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3)  # 3D points
+        
+        # Filter out zeros and NaN values
+        valid_indices = np.where(~np.isnan(vertices).any(axis=1) & (np.abs(vertices) < 1000).all(axis=1))[0]
+        vertices = vertices[valid_indices]
+        
+        # Create Open3D point cloud
+        logger.info("Creating Open3D point cloud")
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vertices)
+        
+        # Assign uniform color (gray) to all points since we're not using RGB
+        colors = np.ones((len(vertices), 3)) * 0.5  # Gray color for all points
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        
+        # Reduce point cloud size if necessary
+        if len(vertices) > 50000:  # Threshold can be adjusted
+            logger.info(f"Downsampling point cloud from {len(vertices)} points")
+            pcd = pcd.voxel_down_sample(voxel_size=0.02)  # Adjust voxel size as needed
+        
+        # Visualize point cloud if requested
+        if visualize:
+            logger.info("Visualizing point cloud")
+            with visualization_lock:  # Use lock to prevent visualization conflicts
+                try:
+                    # Headless check for Raspberry Pi
+                    if "DISPLAY" not in os.environ or not os.environ["DISPLAY"]:
+                        logger.warning("No display available, skipping visualization")
+                    else:
+                        o3d.visualization.draw_geometries([pcd])
+                except Exception as vis_error:
+                    logger.error(f"Visualization error: {vis_error}")
+                    # Continue without visualization
+        
+        return pcd
+    
+    except Exception as e:
+        logger.error(f"Error creating point cloud: {e}")
+        raise
+
+def process_camera_by_serial(device_serial=None, visualize=False):
+    """
+    Process a specific camera identified by its serial number.
+    
+    Args:
+        device_serial (str, optional): Serial number of the camera to use.
+                                       If None, the first available camera will be used.
+        visualize (bool): Whether to visualize the point cloud.
+        
+    Returns:
+        o3d.geometry.PointCloud or None: The created point cloud object, or None if failed.
+    """
+    try:
+        # If no serial provided, try to get the first available camera
+        if device_serial is None:
+            available_cameras = list_available_cameras()
+            if not available_cameras:
+                logger.error("No RealSense cameras found!")
+                return None
+            device_serial = available_cameras[0]
+            logger.info(f"No serial specified, using the first available camera: {device_serial}")
+            
+        # Initialize camera with the specified serial
+        logger.info(f"Initializing camera with serial: {device_serial}")
+        camera = initialize_camera(device_serial)
+        
+        # Create point cloud (no save path)
+        logger.info("Creating point cloud")
+        pcd = create_point_cloud(camera, visualize=visualize)
+        logger.info("Point cloud created successfully")
+        
+        # Stop the camera when done
+        stop_camera(camera)
+        
+        return pcd
+    
+    except Exception as e:
+        logger.error(f"Error processing camera {device_serial}: {e}")
+        if 'camera' in locals():
+            stop_camera(camera)
+        return None
+
+def check_obstacles_in_front(pcd, plane_equation, rectangle_width=2, rectangle_length=3, visualize=True):
+    """
+    Find the closest point within a rectangle in front of the camera (origin)
+    after projecting onto the ground plane, with optional visualization.
+    """
+    if pcd is None or len(np.asarray(pcd.points)) == 0:
+        logger.warning("Empty point cloud, cannot check for obstacles")
+        return None
+    
+    try:
+        logger.info(f"Checking obstacles with visualize={visualize}")
+        # Get points from point cloud
+        points = np.asarray(pcd.points)
+        
+        # Extract plane equation coefficients
+        a, b, c, _ = plane_equation  # Only need normal direction, not 'd'
+        normal_vector = np.array([a, b, c])
+        normal_vector = normal_vector / np.linalg.norm(normal_vector)  # Normalize
+        
+        # Define camera's forward direction (assuming z-axis is forward)
+        camera_forward = np.array([0, 0, 1])
+        
+        # Create a coordinate system on the ground plane
+        # First basis vector tries to align with camera forward projected onto plane
+        forward_projected = camera_forward - np.dot(camera_forward, normal_vector) * normal_vector
+        if np.linalg.norm(forward_projected) < 1e-6:  # If forward is perpendicular to plane
+            x_axis = np.array([1, 0, 0])
+            if abs(np.dot(x_axis, normal_vector)) > 0.9:  # If normal is close to x-axis
+                x_axis = np.array([0, 1, 0])
+            forward_projected = x_axis - np.dot(x_axis, normal_vector) * normal_vector
+            
+        x_parallel = forward_projected / np.linalg.norm(forward_projected)  # First basis vector
+        y_parallel = np.cross(normal_vector, x_parallel)  # Second basis vector
+        y_parallel = y_parallel / np.linalg.norm(y_parallel)  # Normalize
+        
+        # Create projection matrix
+        projection_matrix = np.column_stack([x_parallel, y_parallel])
+        
+        # Project all points (only for classification)
+        points_2d = np.dot(points, projection_matrix)
+        
+        # Check if any points fall within the rectangle
+        in_rectangle = np.logical_and(
+            np.logical_and(points_2d[:, 0] >= 0, points_2d[:, 0] <= rectangle_length),
+            np.logical_and(points_2d[:, 1] >= -rectangle_width/2, points_2d[:, 1] <= rectangle_width/2)
+        )
+        
+        # Initialize closest point variables
+        closest_point = None
+        min_distance = float('inf')
+        
+        # Find closest point in rectangle
+        if np.any(in_rectangle):
+            # Get points that are in the rectangle
+            rectangle_points = points[in_rectangle]
+            
+            # Calculate distances from origin to each point
+            distances = np.linalg.norm(rectangle_points, axis=1)
+            
+            # Find the closest point
+            min_idx = np.argmin(distances)
+            min_distance = distances[min_idx]
+            closest_point = rectangle_points[min_idx]
+        
+        # Visualization
+        if visualize:
+            with visualization_lock:  # Use lock to prevent visualization conflicts
+                # Check if display is available
+                if "DISPLAY" not in os.environ or not os.environ["DISPLAY"]:
+                    logger.warning("No display available, skipping visualization")
+                    return min_distance if closest_point is not None else None
+                
+                try:
+                    # Create a copy of the point cloud for visualization
+                    vis_pcd = o3d.geometry.PointCloud()
+                    vis_pcd.points = o3d.utility.Vector3dVector(points)
+                    
+                    # Color the points based on whether they're in the rectangle
+                    colors = np.zeros((len(points), 3))
+                    colors[in_rectangle] = [1, 0, 0]  # Red for points in rectangle
+                    colors[~in_rectangle] = [0.5, 0.5, 0.5]  # Gray for other points
+                    
+                    # Highlight the closest point if found
+                    if closest_point is not None:
+                        # Find the index of closest point in the original points array
+                        closest_idx = np.where(np.all(points == closest_point, axis=1))[0][0]
+                        colors[closest_idx] = [0, 0, 1]  # Blue for closest point
+                        
+                    vis_pcd.colors = o3d.utility.Vector3dVector(colors)
+                    
+                    # Create rectangle corners in the 2D coordinate system
+                    rect_corners_2d = np.array([
+                        [0, -rectangle_width/2],                # Bottom left
+                        [rectangle_length, -rectangle_width/2], # Bottom right
+                        [rectangle_length, rectangle_width/2],  # Top right
+                        [0, rectangle_width/2],                 # Top left
+                        [0, -rectangle_width/2]                 # Close the loop
+                    ])
+                    
+                    # Convert rectangle corners back to 3D
+                    # We need to find a point on the plane as reference
+                    # Using the normal and a point that satisfies ax + by + cz + d = 0
+                    t = -plane_equation[3] / (a**2 + b**2 + c**2)**0.5  # Distance from origin to plane
+                    point_on_plane = t * normal_vector  # A point on the plane closest to origin
+                    
+                    # Convert 2D rectangle points to 3D
+                    rect_corners_3d = np.zeros((len(rect_corners_2d), 3))
+                    for i, corner in enumerate(rect_corners_2d):
+                        # Convert from 2D plane coordinates to 3D
+                        rect_corners_3d[i] = point_on_plane + corner[0] * x_parallel + corner[1] * y_parallel
+                    
+                    # Create line set for rectangle
+                    lines = [[i, i+1] for i in range(4)]  # Connect consecutive points
+                    line_set = o3d.geometry.LineSet()
+                    line_set.points = o3d.utility.Vector3dVector(rect_corners_3d)
+                    line_set.lines = o3d.utility.Vector2iVector(lines)
+                    line_set.colors = o3d.utility.Vector3dVector([[0, 1, 0] for _ in range(len(lines))])  # Green lines
+                    
+                    # Create coordinate system for visualization
+                    coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3, origin=[0, 0, 0])
+                    
+                    # Visualize
+                    o3d.visualization.draw_geometries([vis_pcd, line_set, coordinate_frame])
+                except Exception as vis_error:
+                    logger.error(f"Visualization error: {vis_error}")
+                    # Continue without visualization
+        
+        if np.any(in_rectangle):
+            logger.info(f"Found {np.sum(in_rectangle)} points in the rectangle")
+            logger.info(f"Closest point: {closest_point}, distance: {min_distance:.4f}")
+            return min_distance
+        else:
+            logger.info("No obstacles detected in the rectangle")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error checking obstacles: {e}")
+        return None
+
+def visualize_and_filter_point_cloud(pcd, camera_position, max_height_inches=40, band_width_inches=2, cylinder_radius=5, brown_radius_inches=10, visualize=False):
+    """
+    Filter and visualize a point cloud with color-coded regions.
+    """
+    if pcd is None or len(np.asarray(pcd.points)) == 0:
+        logger.warning("Empty point cloud, cannot filter")
+        return None
+    
+    try:
+        logger.info(f"Filtering point cloud with visualize={visualize}")
+        # Transform the point cloud so that the camera's position becomes the origin
+        translation_matrix = np.eye(4)
+        translation_matrix[:3, 3] = -np.asarray(camera_position)  # Translate by negative camera position
+        pcd.transform(translation_matrix)
+
+        # Downsample the point cloud for efficiency
+        logger.info("Downsampling point cloud")
+        pcd = pcd.voxel_down_sample(voxel_size=0.05)
+
+        # Perform plane segmentation using RANSAC to find the ground plane
+        logger.info("Performing plane segmentation")
+        plane_model, inliers = pcd.segment_plane(distance_threshold=0.02,
+                                                ransac_n=3,
+                                                num_iterations=1000)
+        [a, b, c, d] = plane_model
+        logger.info(f"Plane equation: {a}x + {b}y + {c}z + {d} = 0")
+
+        # Convert max height and band width from inches to meters
+        max_height_meters = max_height_inches * 0.0254
+        band_width_meters = band_width_inches * 0.0254
+        brown_radius_meters = brown_radius_inches * 0.0254
+
+        # Separate ground plane points (inliers) and others (outliers)
+        logger.info("Separating ground plane points")
+        ground_plane_cloud = pcd.select_by_index(inliers)
+        non_ground_cloud = pcd.select_by_index(inliers, invert=True)
+
+        # Check if we have enough points
+        if len(np.asarray(non_ground_cloud.points)) == 0:
+            logger.warning("No non-ground points found")
+            return None
+        if len(np.asarray(ground_plane_cloud.points)) == 0:
+            logger.warning("No ground points found")
+            return None
+
+        # Step 1: Filter out points above the height threshold from both clouds
+        all_points = np.asarray(non_ground_cloud.points)
+        ground_plane_points = np.asarray(ground_plane_cloud.points)
+
+        distances_to_plane = (a * all_points[:, 0] + b * all_points[:, 1] + c * all_points[:, 2] + d)
+        valid_height_indices = np.where(distances_to_plane <= max_height_meters)[0]
+        non_ground_cloud = non_ground_cloud.select_by_index(valid_height_indices)
+
+        distances_ground = (a * ground_plane_points[:, 0] + b * ground_plane_points[:, 1] + c * ground_plane_points[:, 2] + d)
+        valid_ground_indices = np.where(distances_ground <= max_height_meters)[0]
+        ground_plane_cloud = ground_plane_cloud.select_by_index(valid_ground_indices)
+
+        # Check if we still have enough points after filtering
+        if len(np.asarray(non_ground_cloud.points)) == 0:
+            logger.warning("No non-ground points after height filtering")
+            return None
+
+        # Step 2: Compute horizontal distances for both clouds
+        non_ground_points = np.asarray(non_ground_cloud.points)
+        ground_plane_points = np.asarray(ground_plane_cloud.points)
+
+        projection_matrix = np.eye(3) - np.outer([a, b, c], [a, b, c]) / np.dot([a, b, c], [a, b, c])
+        horizontal_positions_non_ground = non_ground_points @ projection_matrix.T
+        horizontal_positions_ground = ground_plane_points @ projection_matrix.T
+
+        horizontal_distances_non_ground = np.linalg.norm(horizontal_positions_non_ground, axis=1)
+        horizontal_distances_ground = np.linalg.norm(horizontal_positions_ground, axis=1)
+
+        # Step 3: Split points into inside and outside horizontal cutoff for both clouds
+        inside_indices_non_ground = np.where(horizontal_distances_non_ground <= cylinder_radius)[0]
+        outside_indices_non_ground = np.where(horizontal_distances_non_ground > cylinder_radius)[0]
+
+        inside_indices_ground = np.where(horizontal_distances_ground <= cylinder_radius)[0]
+        outside_indices_ground = np.where(horizontal_distances_ground > cylinder_radius)[0]
+
+        # Check if we have points inside the cylinder
+        if len(inside_indices_non_ground) == 0:
+            logger.warning("No non-ground points inside cylinder")
+            return None
+
+        inside_non_ground_cloud = non_ground_cloud.select_by_index(inside_indices_non_ground)
+        outside_non_ground_cloud = non_ground_cloud.select_by_index(outside_indices_non_ground)
+
+        inside_ground_cloud = ground_plane_cloud.select_by_index(inside_indices_ground)
+        outside_ground_cloud = ground_plane_cloud.select_by_index(outside_indices_ground)
+
+        # Step 4: Apply exclusive colors
+        # Brown: Points within the brown radius (inside the cylinder)
+        inside_points = np.asarray(inside_non_ground_cloud.points)
+        distances_inside = (a * inside_points[:, 0] + b * inside_points[:, 1] + c * inside_points[:, 2] + d)
+        horizontal_distances_inside = horizontal_distances_non_ground[inside_indices_non_ground]
+
+        brown_indices = np.where(horizontal_distances_inside <= brown_radius_meters)[0]
+        brown_cloud = inside_non_ground_cloud.select_by_index(brown_indices)
+
+        # Check if we have any points left after filtering
+        if len(brown_indices) == len(inside_points):
+            logger.warning("All inside points are brown")
+            # Just check obstacles in front using the brown cloud
+            return check_obstacles_in_front(
+                brown_cloud, 
+                plane_model, 
+                visualize=visualize
+            )
+
+        # Remove brown points from the "yellow", "red", and "blue" groups
+        remaining_indices = np.setdiff1d(np.arange(len(inside_points)), brown_indices)
+        inside_non_ground_cloud = inside_non_ground_cloud.select_by_index(remaining_indices)
+
+        # Yellow: Points within band_width of the ground plane
+        distances_inside_remaining = distances_inside[remaining_indices]
+        yellow_indices = np.where(np.abs(distances_inside_remaining) <= band_width_meters)[0]
+        yellow_cloud = inside_non_ground_cloud.select_by_index(yellow_indices)
+
+        # Red: Points above the yellow band
+        red_indices = np.where(distances_inside_remaining > band_width_meters)[0]
+        red_cloud = inside_non_ground_cloud.select_by_index(red_indices)
+
+        # Blue: Points below the yellow band
+        blue_indices = np.where(distances_inside_remaining < -band_width_meters)[0]
+        blue_cloud = inside_non_ground_cloud.select_by_index(blue_indices)
+
+        # Green: Ground plane points inside the cylinder
+        green_cloud = inside_ground_cloud
+        # Pink: All points outside the horizontal cutoff (non-ground + ground outside)
+        pink_cloud = outside_non_ground_cloud + outside_ground_cloud
+
+        # Visualize all the groups if requested
+        if visualize:
+            with visualization_lock:  # Use lock to prevent visualization conflicts
+                # Check if display is available
+                if "DISPLAY" not in os.environ or not os.environ["DISPLAY"]:
+                    logger.warning("No display available, skipping visualization")
+                else:
+                    try:
+                        # Only try to visualize clouds that exist and have points
+                        vis_clouds = []
+                        
+                        # Safely add clouds that have points
+                        for cloud, color, name in [
+                            (brown_cloud, [0.6, 0.3, 0], "brown"),
+                            (yellow_cloud, [1, 1, 0], "yellow"),
+                            (red_cloud, [1, 0, 0], "red"),
+                            (blue_cloud, [0, 0, 1], "blue"),
+                            (green_cloud, [0, 1, 0], "green")
+                        ]:
+                            if len(np.asarray(cloud.points)) > 0:
+                                cloud.paint_uniform_color(color)
+                                vis_clouds.append(cloud)
+                                logger.info(f"Added {name} cloud with {len(np.asarray(cloud.points))} points")
+                        
+                        if vis_clouds:
+                            o3d.visualization.draw_geometries(vis_clouds,
+                                                        window_name="Point Cloud Visualization",
+                                                        width=800,
+                                                        height=600,
+                                                        left=50,
+                                                        top=50)
+                    except Exception as vis_error:
+                        logger.error(f"Visualization error: {vis_error}")
+                        # Continue without visualization
+
+        # Combine non-ground clouds for 2D map
+        obs_cloud = None
+        if len(np.asarray(red_cloud.points)) > 0 and len(np.asarray(blue_cloud.points)) > 0:
+            obs_cloud = red_cloud + blue_cloud
+        elif len(np.asarray(red_cloud.points)) > 0:
+            obs_cloud = red_cloud
+        elif len(np.asarray(blue_cloud.points)) > 0:
+            obs_cloud = blue_cloud
+        else:
+            logger.warning("No obstacle points found")
+            return None
+        
+        # Check for obstacles in front
+        return check_obstacles_in_front(
+            obs_cloud, 
+            plane_model, 
+            visualize=visualize
+        )
+        
+    except Exception as e:
+        logger.error(f"Error filtering point cloud: {e}")
+        return None
+
+def detect_obstacles(camera_serial=None, camera_position=[0.0, 0.0, 0.0], visualize=True):
+    """
+    Complete obstacle detection pipeline that generates point cloud from camera
+    and detects obstacles.
+    
+    Args:
+        camera_serial (str, optional): Serial number of camera to use. If None, uses first available.
+        camera_position (list): 3D position of camera [x, y, z]
+        visualize (bool): Whether to visualize the results (controls ALL visualizations)
+        
+    Returns:
+        float or None: Distance to closest obstacle, or None if no obstacles detected/camera not available
+    """
+    # Print visualization status to debug
+    logger.info(f"Visualization is set to: {visualize}")
+    
+    # Check if display is available when visualization is requested
+    if visualize and ("DISPLAY" not in os.environ or not os.environ["DISPLAY"]):
+        logger.warning("Visualization requested but no display available. Setting visualize=False")
+        visualize = False
+    
+    # Check if camera serial is provided, otherwise list available cameras
+    if camera_serial is None:
+        available_cameras = list_available_cameras()
+        if not available_cameras:
+            logger.error("No RealSense cameras found!")
+            return None
+        camera_serial = available_cameras[0]
+        logger.info(f"Using first available camera: {camera_serial}")
+    
+    # Process camera to get point cloud
+    pcd = process_camera_by_serial(
+        device_serial=camera_serial,
+        visualize=visualize  # Pass the visualization flag
+    )
+    
+    if pcd:
+        # Detect obstacles using the point cloud
+        obstacle_range = visualize_and_filter_point_cloud(
+            pcd, 
+            camera_position,
+            max_height_inches=40, 
+            band_width_inches=2, 
+            cylinder_radius=5, 
+            brown_radius_inches=10,
+            visualize=visualize  # Pass the visualization flag
+        )
+        return obstacle_range
+    else:
+        logger.error("Failed to generate point cloud")
+        return None
+
+def main():
+    # Check for visualization flag in arguments
+    visualize = False
+    device_serial = None
+    
+    # Parse command line arguments
+    for arg in sys.argv[1:]:
+        if arg == "--visualize" or arg == "-v":
+            visualize = True
+        elif not arg.startswith("-"):
+            device_serial = arg
+    
+    logger.info(f"Starting obstacle detection with visualization={visualize}")
+    
+    # Call the detect_obstacles function with command line arguments
+    obstacle_range = detect_obstacles(
+        camera_serial=device_serial, 
+        visualize=visualize
+    )
+    logger.info(f"Obstacle range: {obstacle_range}")
+
+if __name__ == "__main__":
+    main()
