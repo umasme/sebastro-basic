@@ -88,7 +88,7 @@ with contextlib.ExitStack() as stack:
             # Create resizable windows for each stream
             # cv2.namedWindow(stream_name, cv2.WINDOW_NORMAL)
 
-        for cam_idx in range(2):  # For two RealSense cameras
+        for cam_idx in range(1):  # For two RealSense cameras
             pipeline = rs.pipeline()
             config = rs.config()
             serial_number = realSense_devices[cam_idx].get_info(rs.camera_info.serial_number)
@@ -112,3 +112,33 @@ with contextlib.ExitStack() as stack:
             realsense_pipelines.append((pipeline, serial_number))
             realsense_profiles.append(profile)
     
+        while True:
+            
+            color_images = []
+            for pipeline, serial_number in realsense_pipelines:
+                frames = pipeline.wait_for_frames()
+                color_frame = frames.get_infrared_frame()
+                if color_frame:
+                    color_image = np.asanyarray(color_frame.get_data())
+                    stream_name = f"realsense-{serial_number}"
+                    mxId = f"realsense-{serial_number}"  # Fake ID, update CAMERA_INFOS if needed
+                    color_images.append((color_image, stream_name, mxId))
+                    cv2.imshow(stream_name, color_image)
+            
+            for q_rgb, stream_name, mxId in qRgbMap:
+                if q_rgb.has():
+                    color_image = q_rgb.get().getCvFrame()
+                    color_images.append((color_image, stream_name, mxId))
+
+            for color_image, stream_name, mxId in color_images:
+                # Convert to grayscale for ArUco detection
+                if mxId == "realsense-247122073398" or mxId == "realsense-327122073351":
+                    gray_image = color_image
+                    scaling_factor = 1.75
+                else:
+                    gray_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+                    scaling_factor = 0.71
+            cv2.imshow(stream_name, color_image)
+
+            if cv2.waitKey(1) == ord('q'):
+                break
